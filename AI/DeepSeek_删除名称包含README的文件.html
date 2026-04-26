@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>删除README文件并打包剩余内容</title>
+    <style>
+        body { font-family: 'Segoe UI', system-ui; max-width: 1000px; margin: 40px auto; padding: 20px; background: #f0f2f5; }
+        .card { background: white; border-radius: 24px; padding: 28px; box-shadow: 0 12px 24px rgba(0,0,0,0.1); }
+        h1 { font-size: 1.8rem; margin-top: 0; color: #1e293b; }
+        .info { background: #e6f7ff; border-left: 5px solid #1890ff; padding: 12px 18px; margin: 20px 0; border-radius: 12px; }
+        button { background: #1890ff; color: white; border: none; padding: 8px 24px; border-radius: 40px; font-size: 1rem; cursor: pointer; transition: 0.2s; margin-right: 12px; }
+        button:hover { background: #0c6bcc; }
+        .checkbox-label { display: inline-flex; align-items: center; gap: 8px; background: #f8fafc; padding: 6px 14px; border-radius: 30px; margin: 10px 0; cursor: pointer; }
+        .status { background: #f8fafc; border-radius: 16px; padding: 16px; font-family: monospace; font-size: 0.85rem; max-height: 400px; overflow-y: auto; margin-top: 20px; white-space: pre-wrap; }
+        .warning { background: #fff2e8; border-left: 4px solid #fa8c16; padding: 12px; margin: 20px 0; border-radius: 8px; }
+        .footer { text-align: center; margin-top: 30px; color: #5a6874; font-size: 0.8rem; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+</head>
+<body>
+<div class="card">
+    <h1>🗑️ 删除 README 文件 · 打包剩余内容</h1>
+    <div class="info">
+        <strong>📌 功能说明</strong><br>
+        • 选择一个根文件夹，工具会<strong>递归扫描所有子文件夹</strong>。<br>
+        • 自动<strong>排除文件名包含 "README"（不区分大小写）的文件</strong>（例如 README.md, readme.txt, sub/README.pdf）。<br>
+        • 其余所有文件将被打包成一个 <strong>ZIP 压缩包</strong> 供您下载。<br>
+        • <strong>原始文件不会被修改</strong>，下载的 ZIP 就是“删除 README 后的完整副本”。<br>
+        • 可选：将全部文件转换为 <code>.txt</code> 格式（文件名保留原扩展名基础部分）。
+    </div>
+
+    <div style="margin: 20px 0;">
+        <button id="selectBtn">📂 1. 选择根文件夹</button>
+        <span id="folderPath" style="margin-left: 15px; font-weight: 500;"></span>
+    </div>
+
+    <label class="checkbox-label">
+        <input type="checkbox" id="convertToTxt"> 将所有文件转换为 .txt 格式（原扩展名将被替换为 .txt）
+    </label>
+
+    <div id="progressArea" style="display: none;">
+        <button id="processBtn" disabled>⚙️ 2. 开始打包（自动删除README）</button>
+        <div class="status" id="logArea">等待选择文件夹...</div>
+    </div>
+
+    <div class="warning">
+        ⚠️ 注意：<br>
+        • 需要浏览器支持 File System Access API（Chrome / Edge 86+）。<br>
+        • 二进制文件（图片、PDF 等）若转为 .txt 会变成乱码，建议仅对纯文本文件开启转换。<br>
+        • 打包过程需要读取所有文件内容，文件较多时请耐心等待。<br>
+        • 下载的 ZIP 内文件为“扁平化”存储（所有文件都在根目录），文件名会包含原相对路径（用下划线连接）以避免重名。
+    </div>
+</div>
+<div class="footer">
+    本地处理 · 不上传任何数据
+</div>
+
+<script>
+    let selectedRootHandle = null;
+    let keepFiles = [];      // 存储 { relativePathArray, fileName, fileHandle }
+    let convertToTxtFlag = false;
+
+    const selectBtn = document.getElementById('selectBtn');
+    const folderPathSpan = document.getElementById('folderPath');
+    const progressArea = document.getElementById('progressArea');
+    const processBtn = document.getElementById('processBtn');
+    const logArea = document.getElementById('logArea');
+    const convertToTxtCheck = document.getElementById('convertToTxt');
+
+    function log(msg, isError = false) {
+        const div = document.createElement('div');
+        div.textContent = msg;
+        div.style.color = isError ? '#d4380d' : '#1e293b';
+        div.style.marginBottom = '4px';
+        logArea.appendChild(div);
+        logArea.scrollTop = logArea.scrollHeight;
+        console.log(msg);
+    }
+
+    function clearLog() {
+        logArea.innerHTML = '';
+    }
+
+    selectBtn.addEventListener('click', async () => {
+        if (!window.showDirectoryPicker) {
+            alert('您的浏览器不支持 File System Access API。请使用 Chrome 或 Edge 86 以上版本。');
+            return;
+        }
+        try {
+            const handle = await window.showDirectoryPicker();
+            selectedRootHandle = handle;
+            folderPathSpan.textContent = `✅ ${handle.name}`;
+            progressArea.style.display = 'block';
+            processBtn.disabled = false;
+            clearLog();
+            log(`已选择根文件夹: ${handle.name}`);
+        } catch (err) {
+            if (err.name !== 'AbortError') {
+                alert('选择失败: ' + err.message);
+            }
+        }
+    });
+
+    // 递归遍历，收集所有文件名不包含 README 的文件（不区分大小写）
+    async function collectNonReadmeFiles(dirHandle, relativePathArray) {
+        let results = [];
+        for await (const entry of dirHandle.values()) {
+            if (entry.kind === 'file') {
+                const fileName = entry.name;
+                if (!fileName.toLowerCase().includes('readme')) {
+                    results.push({
+                        relativePathArray: [...relativePathArray], // 上层文件夹数组
+                        fileName: fileName,
+                        fileHandle: entry
+                    });
+                }
+            } else if (entry.kind === 'directory') {
+                const subResults = await collectNonReadmeFiles(entry, [...relativePathArray, entry.name]);
+                results.push(...subResults);
+            }
+        }
+        return results;
+    }
+
+    // 生成最终 ZIP 内的文件名
+    // 如果 convertToTxt == true, 扩展名改为 .txt；否则保留原扩展名
+    // 为了避免文件名冲突，用下划线连接所有父文件夹名 + 原文件名（基础名）
+    function makeZipFileName(relativePathArray, originalName, convertToTxt) {
+        let baseName = originalName;
+        const lastDot = originalName.lastIndexOf('.');
+        if (convertToTxt) {
+            // 只保留基础名（去掉原扩展名），加上 .txt
+            if (lastDot > 0) {
+                baseName = originalName.substring(0, lastDot);
+            }
+            baseName += '.txt';
+        } else {
+            // 保留原文件名（包括扩展名）
+            baseName = originalName;
+        }
+        // 构建前缀：用下划线连接所有父文件夹
+        let prefix = relativePathArray.length > 0 ? relativePathArray.join('_') + '_' : '';
+        let finalName = prefix + baseName;
+        // 替换 Windows 非法字符
+        finalName = finalName.replace(/[\\/:*?"<>|]/g, '_');
+        return finalName;
+    }
+
+    processBtn.addEventListener('click', async () => {
+        if (!selectedRootHandle) {
+            alert('请先选择根文件夹');
+            return;
+        }
+
+        convertToTxtFlag = convertToTxtCheck.checked;
+        processBtn.disabled = true;
+        processBtn.textContent = '⏳ 扫描中...';
+        clearLog();
+        log('🔍 正在递归扫描所有子文件夹，排除包含 README 的文件...');
+
+        let allNonReadme = [];
+        try {
+            allNonReadme = await collectNonReadmeFiles(selectedRootHandle, []);
+            log(`✅ 扫描完成。共找到 ${allNonReadme.length} 个不包含 README 的文件。`);
+        } catch (err) {
+            log(`❌ 扫描失败: ${err.message}`, true);
+            processBtn.disabled = false;
+            processBtn.textContent = '⚙️ 2. 开始打包（自动删除README）';
+            return;
+        }
+
+        if (allNonReadme.length === 0) {
+            log('⚠️ 没有找到任何符合条件的文件，将生成空 ZIP。');
+        }
+
+        const zip = new JSZip();
+        let successCount = 0;
+        let failCount = 0;
+        processBtn.textContent = `📦 读取文件并打包 (0/${allNonReadme.length}) ...`;
+
+        for (let i = 0; i < allNonReadme.length; i++) {
+            const item = allNonReadme[i];
+            const zipFileName = makeZipFileName(item.relativePathArray, item.fileName, convertToTxtFlag);
+            try {
+                const fileObj = await item.fileHandle.getFile();
+                let content;
+                if (convertToTxtFlag) {
+                    // 转换为文本（UTF-8），二进制会乱码但用户自己负责
+                    content = await fileObj.text();
+                } else {
+                    // 保留原始二进制内容
+                    content = await fileObj.arrayBuffer();
+                }
+                zip.file(zipFileName, content);
+                successCount++;
+                if ((i + 1) % 100 === 0 || i === allNonReadme.length - 1) {
+                    processBtn.textContent = `📦 处理中 ${i+1}/${allNonReadme.length} ...`;
+                    log(`已处理 ${i+1} 个文件，成功 ${successCount} 个`);
+                }
+            } catch (err) {
+                failCount++;
+                log(`❌ 读取失败: ${item.relativePathArray.join('/')}/${item.fileName} - ${err.message}`, true);
+            }
+        }
+
+        log(`📦 打包完成。成功: ${successCount}, 失败: ${failCount}。正在生成 ZIP...`);
+        try {
+            const zipBlob = await zip.generateAsync({ type: "blob" });
+            const zipName = `${selectedRootHandle.name}_无README文件${convertToTxtFlag ? '_转TXT' : ''}.zip`;
+            saveAs(zipBlob, zipName);
+            log(`🎉 下载已开始: ${zipName}`);
+        } catch (err) {
+            log(`💥 创建 ZIP 失败: ${err.message}`, true);
+        }
+
+        processBtn.disabled = false;
+        processBtn.textContent = '⚙️ 2. 开始打包（自动删除README）';
+    });
+</script>
+</body>
+</html>
